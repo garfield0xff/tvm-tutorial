@@ -6,6 +6,16 @@ from torchvision.models import ResNet18_Weights, resnet18
 import tvm
 import numpy as np
 
+'''
+torch.fx : pytorch model -> fx graph
+  # graph:
+  #   %x : [num_users=1] = placeholder[target=x]
+  #   %conv1 : [num_users=1] = call_module[target=conv1](args = (%x,))
+  #   %relu : [num_users=1] = call_module[target=relu](args = (%conv1,))
+  #   return relu
+
+from_fx : fx graph -> tvm relax ir
+'''
 def create_resnet18_with_weights(pytorch_model, keep_params=False):
     import torch.fx as fx
 
