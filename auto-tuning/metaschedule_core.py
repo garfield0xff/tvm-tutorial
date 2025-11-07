@@ -81,6 +81,7 @@ def create_resnet18_with_weights(pytorch_model, keep_params=False):
     return relax_mod
 
 def classify_image(vm, device, image_tensor, labels, top_k=5):
+    # PyTorch tensor → TVM
     img_np = image_tensor.numpy()
     img_tvm = tvm.runtime.tensor(img_np)
 
@@ -88,7 +89,8 @@ def classify_image(vm, device, image_tensor, labels, top_k=5):
     for _ in range(5):
         _ = vm["main"](img_tvm)
 
-    num_iterations = 100
+    # Inference Benchmark (100)
+    num_iterations = 10
     print(f"  ⏱ {num_iterations}회 inference Benchmark...")
 
     inference_times = []
@@ -136,7 +138,7 @@ def classify_image(vm, device, image_tensor, labels, top_k=5):
 
     return avg_time, top_predictions
 
-def compile_model(relax_mod, use_auto_tuning=True, num_trials=64, opt_level=0):
+def compile_model(relax_mod, use_auto_tuning=True, num_trials=64, opt_level=0, max_workers=None):
     num_cores = multiprocessing.cpu_count()
     target = tvm.target.Target(f"llvm -num-cores {num_cores}")
 
@@ -144,18 +146,31 @@ def compile_model(relax_mod, use_auto_tuning=True, num_trials=64, opt_level=0):
         relax_mod = relax.get_pipeline("zero")(relax_mod)
 
     if use_auto_tuning:
+        import tvm.meta_schedule as ms
+        from tvm.meta_schedule.builder import LocalBuilder
         from tvm.ir.transform import PassContext
 
-        # work_dir을 persistent directory로 설정
         work_dir = "tuning_database"
         os.makedirs(work_dir, exist_ok=True)
 
-        with target, PassContext(opt_level=opt_level):
-            tuning_pass = relax.transform.MetaScheduleTuneTIR(
-                work_dir = work_dir,
-                max_trials_global=num_trials
+        if max_workers is None:
+            max_workers = num_cores
+
+        print(f"🔧 Meta Schedule Tuning 시작 (max_workers={max_workers})")
+
+        builder = LocalBuilder(max_workers=max_workers)
+
+        # TIR 함수들을 추출하고 tuning
+        with target:
+            # MetaSchedule 내부 연산인 tune_tir 직접 실행 -> worker 숫자를 여기서 지정할 수 있음.
+            ms.tune_tir(
+                mod=relax_mod,
+                target=target,
+                work_dir=work_dir,
+                max_trials_global=num_trials,
+                builder=builder,
+                num_tuning_cores=max_workers,  
             )
-            relax_mod = tuning_pass(relax_mod)
 
         with target, PassContext(opt_level=opt_level):
             application_pass = relax.transform.MetaScheduleApplyDatabase(work_dir)
@@ -178,6 +193,7 @@ if __name__ == "__main__":
         USE_AUTO_TUNING = True
         NUM_TRIALS = 2
         OPT_LEVEL = 3
+        MAX_WORKERS = 4  #  set worker num
 
         labels = load_imagenet_labels()
         image_tensor, original_image = load_and_preprocess_image(IMAGE_PATH)
@@ -189,7 +205,8 @@ if __name__ == "__main__":
             relax_mod,
             use_auto_tuning=USE_AUTO_TUNING,
             num_trials=NUM_TRIALS,
-            opt_level=OPT_LEVEL
+            opt_level=OPT_LEVEL,
+            max_workers=MAX_WORKERS
         )
 
         tvm_time, tvm_predictions = classify_image(vm, device, image_tensor, labels, top_k=5)
