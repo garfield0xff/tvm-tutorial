@@ -90,7 +90,7 @@ def classify_image(vm, device, image_tensor, labels, top_k=5):
         _ = vm["main"](img_tvm)
 
     # Inference Benchmark (100)
-    num_iterations = 10
+    num_iterations = 100
     print(f"  ⏱ {num_iterations}회 inference Benchmark...")
 
     inference_times = []
@@ -140,7 +140,15 @@ def classify_image(vm, device, image_tensor, labels, top_k=5):
 
 def compile_model(relax_mod, use_auto_tuning=True, num_trials=64, opt_level=0, max_workers=None):
     num_cores = multiprocessing.cpu_count()
-    target = tvm.target.Target(f"llvm -num-cores {num_cores}")
+
+    # Apple Silicon (M2 Pro) 최적화 설정
+    # LLVM 19와 호환되는 안전한 feature flags만 사용
+    target = tvm.target.Target(
+        f"llvm -mtriple=arm64-apple-darwin "
+        f"-mattr=+neon,+crypto,+dotprod,+crc,+lse "
+        f"-num-cores {num_cores} "
+        f"-libs=cblas"  # Apple Accelerate Framework 사용
+    )
 
     with target:
         relax_mod = relax.get_pipeline("zero")(relax_mod)
@@ -148,6 +156,7 @@ def compile_model(relax_mod, use_auto_tuning=True, num_trials=64, opt_level=0, m
     if use_auto_tuning:
         import tvm.meta_schedule as ms
         from tvm.meta_schedule.builder import LocalBuilder
+        from tvm.meta_schedule.runner import LocalRunner, EvaluatorConfig
         from tvm.ir.transform import PassContext
 
         work_dir = "tuning_database"
@@ -157,19 +166,41 @@ def compile_model(relax_mod, use_auto_tuning=True, num_trials=64, opt_level=0, m
             max_workers = num_cores
 
         print(f"🔧 Meta Schedule Tuning 시작 (max_workers={max_workers})")
+        print(f"   - max_trials_global: {num_trials}")
+        print(f"   - max_trials_per_task: 200")
+        print(f"   - evaluator: number=10, repeat=3, min_repeat_ms=200ms")
+        print(f"   - post_optimization: True")
 
+        # Builder 설정
         builder = LocalBuilder(max_workers=max_workers)
 
+        # Runner 설정 - 더 정확한 성능 측정을 위한 설정
+        runner = LocalRunner(
+            timeout_sec=60,  # 타임아웃 60초
+            evaluator_config=EvaluatorConfig(
+                number=10,          # 각 측정마다 10회 실행
+                repeat=3,           # 3회 반복 측정
+                min_repeat_ms=200,  # 최소 200ms 측정
+                enable_cpu_cache_flush=False,
+            ),
+        )
+
         # TIR 함수들을 추출하고 tuning
-        with target:
-            # MetaSchedule 내부 연산인 tune_tir 직접 실행 -> worker 숫자를 여기서 지정할 수 있음.
+        with target, PassContext(opt_level=opt_level):
             ms.tune_tir(
                 mod=relax_mod,
                 target=target,
                 work_dir=work_dir,
                 max_trials_global=num_trials,
+                max_trials_per_task=200,        # 각 task당 최대 200 trials
+                num_trials_per_iter=64,         # 반복당 64 trials -> batch size
                 builder=builder,
-                num_tuning_cores=max_workers,  
+                runner=runner,                  # 커스텀 runner 사용
+                cost_model="xgb",               # XGBoost 비용 모델
+                strategy="evolutionary",        # Evolutionary 검색 전략
+                task_scheduler="gradient",      # Gradient-based 스케줄러
+                num_tuning_cores=max_workers,
+                post_optimization=True,         # 후처리 최적화 활성화
             )
 
         with target, PassContext(opt_level=opt_level):
@@ -191,9 +222,9 @@ if __name__ == "__main__":
         IMAGE_PATH = "../sample/img/dog.jpeg"
 
         USE_AUTO_TUNING = True
-        NUM_TRIALS = 2
+        NUM_TRIALS = 2000
         OPT_LEVEL = 3
-        MAX_WORKERS = 4  #  set worker num
+        MAX_WORKERS = 10  #  set worker num
 
         labels = load_imagenet_labels()
         image_tensor, original_image = load_and_preprocess_image(IMAGE_PATH)
